@@ -82,6 +82,9 @@ public class SiegePredictor {
         return res;
     }
 
+    // Радиус красного круга вокруг точки падения (в блоках)
+    private static final double RING_RADIUS = 2.5;
+
     private static void render(DrawContext ctx, RenderTickCounter tc) {
         MinecraftClient mc = MinecraftClient.getInstance();
         if (!enabled || mc.player == null || mc.world == null || mc.options.hudHidden) return;
@@ -89,9 +92,10 @@ public class SiegePredictor {
         if (w < 0 || w > 2) return;
 
         Camera cam = mc.gameRenderer.getCamera();
-        boolean first = mc.options.getPerspective().isFirstPerson();
-        double yaw = first ? cam.getYaw() : mc.player.getYaw();
-        double pitch = first ? cam.getPitch() : mc.player.getPitch();
+        // Прицел считается от самого игрока (его позиция и его взгляд), а не от камеры.
+        // Камера (в том числе фрикам) нужна только для того, чтобы нарисовать линию на экране.
+        double yaw = mc.player.getYaw();
+        double pitch = mc.player.getPitch();
 
         Result res = compute(mc, w, yaw, pitch);
 
@@ -106,48 +110,70 @@ public class SiegePredictor {
         double fx = -Math.sin(cy) * Math.cos(cpit), fy = -Math.sin(cpit), fz = Math.cos(cy) * Math.cos(cpit);
         double rx = -Math.cos(cy), ry = 0, rz = -Math.sin(cy);
         double ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx;
+        double[] basis = {fx, fy, fz, rx, ry, rz, ux, uy, uz};
 
-        // линия траектории (каждая 2-я точка = раз в блок)
-        for (int i = 0; i < res.pts.size(); i += 2) {
-            double[] sp = project(res.pts.get(i), cp, fx, fy, fz, rx, ry, rz, ux, uy, uz, W, H, scale);
-            if (sp == null) continue;
-            int x = (int) sp[0], y = (int) sp[1];
-            ctx.fill(x - 1, y - 1, x + 1, y + 1, 0xFFFFE04A);
+        // белая линия траектории
+        List<Vec3d> pts = new ArrayList<>(res.pts);
+        if (res.landing != null) pts.add(res.landing);
+        double[] prev = null;
+        for (int i = 0; i < pts.size(); i += 2) {
+            double[] cur = project(pts.get(i), cp, basis, W, H, scale);
+            line(ctx, prev, cur, 0xFFFFFFFF, W, H);
+            prev = cur;
+        }
+        if (!pts.isEmpty()) {
+            double[] last = project(pts.get(pts.size() - 1), cp, basis, W, H, scale);
+            line(ctx, prev, last, 0xFFFFFFFF, W, H);
         }
 
-        String line;
+        String text;
         if (res.landing != null) {
             Vec3d l = res.landing;
             double dist = Math.hypot(l.x - mc.player.getX(), l.z - mc.player.getZ());
-            line = String.format(Locale.ROOT, "%s | падение: %d %d %d | дальность %.0f бл.",
+            text = String.format(Locale.ROOT, "%s | падение: %d %d %d | дальность %.0f бл.",
                     NAMES[w], (int) Math.floor(l.x), (int) Math.floor(l.y), (int) Math.floor(l.z), dist);
-            double[] sp = project(l, cp, fx, fy, fz, rx, ry, rz, ux, uy, uz, W, H, scale);
-            if (sp != null) {
-                int x = (int) sp[0], y = (int) sp[1];
-                ctx.fill(x - 4, y - 4, x + 4, y + 4, 0xFFFF3030);
-                ctx.fill(x - 2, y - 2, x + 2, y + 2, 0xFFFFFFFF);
-                ctx.drawTextWithShadow(mc.textRenderer, Text.literal("Падение"), x + 7, y - 4, 0xFFFF6060);
+
+            // красный круг на земле вокруг точки падения
+            double[] firstRing = null, prevRing = null;
+            int segs = 40;
+            for (int k = 0; k <= segs; k++) {
+                double a = 2 * Math.PI * k / segs;
+                Vec3d rp = new Vec3d(l.x + RING_RADIUS * Math.cos(a), l.y + 0.15, l.z + RING_RADIUS * Math.sin(a));
+                double[] cur = project(rp, cp, basis, W, H, scale);
+                line(ctx, prevRing, cur, 0xFFFF2020, W, H);
+                prevRing = cur;
+            }
+            double[] c = project(new Vec3d(l.x, l.y + 0.15, l.z), cp, basis, W, H, scale);
+            if (c != null) {
+                int x = (int) c[0], y = (int) c[1];
+                ctx.fill(x - 2, y - 2, x + 2, y + 2, 0xFFFF2020);
             }
         } else {
-            line = NAMES[w] + " | падение не видно: " + res.stop;
+            text = NAMES[w] + " | падение не видно: " + res.stop;
         }
-        int tw = mc.textRenderer.getWidth(line);
-        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(line), (W - tw) / 2, 18, 0xFFFFFFFF);
+        int tw = mc.textRenderer.getWidth(text);
+        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(text), (W - tw) / 2, 18, 0xFFFFFFFF);
     }
 
-    private static double[] project(Vec3d p, Vec3d cp,
-                                    double fx, double fy, double fz,
-                                    double rx, double ry, double rz,
-                                    double ux, double uy, double uz,
-                                    int W, int H, double scale) {
+    private static void line(DrawContext ctx, double[] a, double[] b, int color, int W, int H) {
+        if (a == null || b == null) return;
+        double dx = b[0] - a[0], dy = b[1] - a[1];
+        int n = (int) Math.min(Math.max(Math.abs(dx), Math.abs(dy)), 1500);
+        if (n < 1) n = 1;
+        for (int i = 0; i <= n; i++) {
+            int x = (int) (a[0] + dx * i / n);
+            int y = (int) (a[1] + dy * i / n);
+            if (x < -2 || x > W + 2 || y < -2 || y > H + 2) continue;
+            ctx.fill(x, y, x + 2, y + 2, color);
+        }
+    }
+
+    private static double[] project(Vec3d p, Vec3d cp, double[] b, int W, int H, double scale) {
         double dx = p.x - cp.x, dy = p.y - cp.y, dz = p.z - cp.z;
-        double cz = dx * fx + dy * fy + dz * fz;
+        double cz = dx * b[0] + dy * b[1] + dz * b[2];
         if (cz <= 0.05) return null;
-        double cx = dx * rx + dy * ry + dz * rz;
-        double cyy = dx * ux + dy * uy + dz * uz;
-        double sx = W / 2.0 + cx / cz * scale;
-        double sy = H / 2.0 - cyy / cz * scale;
-        if (sx < -50 || sx > W + 50 || sy < -50 || sy > H + 50) return null;
-        return new double[]{sx, sy};
+        double cx = dx * b[3] + dy * b[4] + dz * b[5];
+        double cyy = dx * b[6] + dy * b[7] + dz * b[8];
+        return new double[]{W / 2.0 + cx / cz * scale, H / 2.0 - cyy / cz * scale};
     }
 }

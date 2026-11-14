@@ -8,6 +8,7 @@ import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.render.Camera;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.ExperienceOrbEntity;
@@ -17,6 +18,10 @@ import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.registry.Registries;
 import net.minecraft.text.Text;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
+import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
 import org.lwjgl.glfw.GLFW;
 
 import java.io.IOException;
@@ -51,6 +56,14 @@ public class SiegeRecClient implements ClientModInitializer {
     private KeyBinding toggleKey;
     private KeyBinding labelKey;
     private KeyBinding predictKey;
+    private KeyBinding markKey;
+
+    // последний записанный выстрел (для сравнения с реальным местом падения)
+    private int shotNo = 0;
+    private double[] lastLaunch = null;
+    private double[] lastPredThin = null, lastPredWide = null;
+    private String lastLabel = "";
+    private double lastPx, lastPz;
 
     @Override
     public void onInitializeClient() {
@@ -60,6 +73,8 @@ public class SiegeRecClient implements ClientModInitializer {
                 "key.siegerec.label", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_K, "category.siegerec"));
         predictKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.siegerec.predict", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_L, "category.siegerec"));
+        markKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.siegerec.mark", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_U, "category.siegerec"));
         SiegePredictor.init();
         ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
     }
@@ -86,6 +101,9 @@ public class SiegeRecClient implements ClientModInitializer {
             recording = !recording;
             if (!recording) { tracks.clear(); finished.clear(); }
             msg(mc, recording ? "запись ВКЛЮЧЕНА" : "запись выключена");
+        }
+        while (markKey.wasPressed()) {
+            markLanding(mc);
         }
         while (predictKey.wasPressed()) {
             SiegePredictor.enabled = !SiegePredictor.enabled;
@@ -157,6 +175,64 @@ public class SiegeRecClient implements ClientModInitializer {
         finished.retainAll(seen);
     }
 
+    private static JsonArray arr(double[] v) {
+        JsonArray a = new JsonArray();
+        if (v == null) return a;
+        for (double d : v) a.add(r(d));
+        return a;
+    }
+
+    private static double hd(double[] a, double[] b) {
+        return Math.hypot(a[0] - b[0], a[2] - b[2]);
+    }
+
+    /** Клавиша U: навёл камеру (хоть фрикам) на место, куда упал снаряд, и нажал. */
+    private void markLanding(MinecraftClient mc) {
+        if (mc.player == null || mc.world == null) return;
+        if (lastLaunch == null) { msg(mc, "сначала сделай выстрел"); return; }
+        Camera cam = mc.gameRenderer.getCamera();
+        Vec3d start = cam.getPos();
+        double yw = Math.toRadians(cam.getYaw()), pt = Math.toRadians(cam.getPitch());
+        Vec3d dir = new Vec3d(-Math.sin(yw) * Math.cos(pt), -Math.sin(pt), Math.cos(yw) * Math.cos(pt));
+        BlockHitResult hit = mc.world.raycast(new RaycastContext(start, start.add(dir.multiply(400)),
+                RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, mc.player));
+        if (hit.getType() != HitResult.Type.BLOCK) { msg(mc, "не вижу блок под прицелом, наведи на место падения"); return; }
+        Vec3d h = hit.getPos();
+        double[] actual = {h.x, h.y, h.z};
+
+        JsonObject o = new JsonObject();
+        o.addProperty("type", "landing_mark");
+        o.addProperty("shot", shotNo);
+        o.addProperty("label", lastLabel);
+        o.add("launch", arr(lastLaunch));
+        o.add("actual", arr(actual));
+        o.add("pred_thin", arr(lastPredThin));
+        o.add("pred_wide", arr(lastPredWide));
+        double ad = hd(actual, new double[]{lastPx, 0, lastPz});
+        o.addProperty("actual_distance_from_player", r(ad));
+        StringBuilder sb = new StringBuilder(String.format(Locale.ROOT,
+                "падение выстрела #%d [%s]: %.0f бл. от тебя", shotNo, lastLabel, ad));
+        if (lastPredWide != null) {
+            double ew = hd(actual, lastPredWide);
+            o.addProperty("error_wide", r(ew));
+            sb.append(String.format(Locale.ROOT, ", прицел (с запасом) ошибся на %.1f", ew));
+        }
+        if (lastPredThin != null) {
+            double et = hd(actual, lastPredThin);
+            o.addProperty("error_thin", r(et));
+            sb.append(String.format(Locale.ROOT, ", без запаса на %.1f", et));
+        }
+        try {
+            Path f = FabricLoader.getInstance().getGameDir().resolve("siege_logs").resolve("siege_log.jsonl");
+            Files.createDirectories(f.getParent());
+            Files.writeString(f, o + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException ex) {
+            msg(mc, "не смог записать файл: " + ex.getMessage());
+            return;
+        }
+        msg(mc, sb.toString());
+    }
+
     private static double r(double v) { return Math.round(v * 1000.0) / 1000.0; }
 
     private void finish(MinecraftClient mc, Track t) {
@@ -169,7 +245,7 @@ public class SiegeRecClient implements ClientModInitializer {
             double[] p = t.pts.get(i - 1), q = t.pts.get(i);
             path += Math.sqrt(Math.pow(q[0]-p[0],2)+Math.pow(q[1]-p[1],2)+Math.pow(q[2]-p[2],2));
         }
-        if (path < 3) return; // мелочь, не снаряд
+        if (path < 3 || horiz < 8) return; // мелочь и падающие вниз штуки, не выстрел
 
         JsonObject o = new JsonObject();
         o.addProperty("label", LABELS[labelIdx]);
@@ -190,6 +266,25 @@ public class SiegeRecClient implements ClientModInitializer {
             pts.add(x);
         }
         o.add("points", pts);
+
+        // что предсказывал прицел для этого выстрела (по записанному взгляду и позиции игрока)
+        double[] predThin = null, predWide = null;
+        if (labelIdx < 3) {
+            SiegePredictor.Result rt = SiegePredictor.compute(mc, labelIdx, t.yaw, t.pitch, t.px, t.py, t.pz, 0);
+            SiegePredictor.Result rw = SiegePredictor.compute(mc, labelIdx, t.yaw, t.pitch, t.px, t.py, t.pz, SiegePredictor.WIDE_MARGIN);
+            if (rt.landing != null) predThin = new double[]{rt.landing.x, rt.landing.y, rt.landing.z};
+            if (rw.landing != null) predWide = new double[]{rw.landing.x, rw.landing.y, rw.landing.z};
+            o.add("pred_thin", arr(predThin));
+            o.add("pred_wide", arr(predWide));
+        }
+        shotNo++;
+        o.addProperty("shot", shotNo);
+        lastLaunch = new double[]{a[0], a[1], a[2]};
+        lastPredThin = predThin;
+        lastPredWide = predWide;
+        lastLabel = LABELS[labelIdx];
+        lastPx = t.px;
+        lastPz = t.pz;
 
         try {
             Path f = FabricLoader.getInstance().getGameDir().resolve("siege_logs").resolve("siege_log.jsonl");

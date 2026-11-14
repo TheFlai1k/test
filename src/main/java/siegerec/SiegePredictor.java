@@ -26,7 +26,7 @@ import java.util.Locale;
  */
 public class SiegePredictor {
 
-    private static final String[] NAMES = {"Требушет", "Катапульта", "Баллиста"};
+    static final String[] NAMES = {"Требушет", "Катапульта", "Баллиста"};
     // C = g / (2 v^2), подобрано по логам
     private static final double[] C = {0.00315, 0.00832, 0.00187};
     // откуда вылетает снаряд относительно игрока: вперёд (блоков) и вверх = H0 + H1 * угол_вверх
@@ -34,22 +34,42 @@ public class SiegePredictor {
     private static final double[] H0 = {8.74, 3.82, 3.67};
     private static final double[] H1 = {0.0148, 0.0074, 0.0164};
 
-    public static boolean enabled = true;
+    // Запас на размер снаряда: проверяем не одну точку, а кубик вокруг неё (в блоках от центра)
+    static final double WIDE_MARGIN = 0.4;
+    // Радиус красного круга вокруг точки падения (в блоках)
+    private static final double RING_RADIUS = 2.5;
 
-    private static class Result {
+    public static boolean enabled = true;
+    private static String hudText = null;
+
+    static class Result {
         final List<Vec3d> pts = new ArrayList<>();
         Vec3d landing = null;
         String stop = "";
     }
-
-    private static String hudText = null;
 
     static void init() {
         WorldRenderEvents.AFTER_ENTITIES.register(SiegePredictor::renderWorld);
         HudRenderCallback.EVENT.register(SiegePredictor::renderHud);
     }
 
-    private static Result compute(MinecraftClient mc, int w, double yawDeg, double pitchDeg) {
+    private static boolean solid(ClientWorld world, double x, double y, double z) {
+        BlockPos bp = BlockPos.ofFloored(x, y, z);
+        return !world.getBlockState(bp).getCollisionShape(world, bp).isEmpty();
+    }
+
+    private static boolean blocked(ClientWorld world, double x, double y, double z, double m) {
+        if (m <= 0) return solid(world, x, y, z);
+        for (double dx = -m; dx <= m + 1e-9; dx += m)
+            for (double dy = -m; dy <= m + 1e-9; dy += m)
+                for (double dz = -m; dz <= m + 1e-9; dz += m)
+                    if (solid(world, x + dx, y + dy, z + dz)) return true;
+        return false;
+    }
+
+    /** margin = 0: снаряд как точка; margin > 0: снаряд как кубик с запасом. */
+    static Result compute(MinecraftClient mc, int w, double yawDeg, double pitchDeg,
+                          double px, double py, double pz, double margin) {
         Result res = new Result();
         ClientWorld world = mc.world;
         double yaw = Math.toRadians(yawDeg);
@@ -60,9 +80,10 @@ public class SiegePredictor {
         double cos2 = Math.cos(th) * Math.cos(th);
         double fx = -Math.sin(yaw), fz = Math.cos(yaw);
 
-        double x0 = mc.player.getX() + fx * FWD[w];
-        double z0 = mc.player.getZ() + fz * FWD[w];
-        double y0 = mc.player.getY() + H0[w] + H1[w] * up;
+        double x0 = px + fx * FWD[w];
+        double z0 = pz + fz * FWD[w];
+        double y0 = py + H0[w] + H1[w] * up;
+        double startCheck = margin > 0 ? 8 : 3;
 
         for (double s = 0; s <= 700; s += 0.5) {
             double x = x0 + fx * s;
@@ -77,12 +98,9 @@ public class SiegePredictor {
                 res.stop = "ниже мира";
                 return res;
             }
-            if (s >= 3) {
-                BlockPos bp = BlockPos.ofFloored(x, y, z);
-                if (!world.getBlockState(bp).getCollisionShape(world, bp).isEmpty()) {
-                    res.landing = p;
-                    return res;
-                }
+            if (s >= startCheck && blocked(world, x, y, z, margin)) {
+                res.landing = p;
+                return res;
             }
             res.pts.add(p);
         }
@@ -90,11 +108,6 @@ public class SiegePredictor {
         return res;
     }
 
-    // Радиус красного круга вокруг точки падения (в блоках)
-    private static final double RING_RADIUS = 2.5;
-
-    // Линия и круг рисуются прямо в мире (как обводка блока), поэтому они гладкие
-    // и стоят на месте, как бы ты ни двигал камеру (в том числе фрикам).
     private static void renderWorld(WorldRenderContext ctx) {
         MinecraftClient mc = MinecraftClient.getInstance();
         hudText = null;
@@ -105,14 +118,22 @@ public class SiegePredictor {
         VertexConsumerProvider consumers = ctx.consumers();
         if (matrices == null || consumers == null) return;
 
-        // прицел считается от самого игрока: его позиция и его взгляд
-        Result res = compute(mc, w, mc.player.getYaw(), mc.player.getPitch());
+        double yaw = mc.player.getYaw(), pitch = mc.player.getPitch();
+        double px = mc.player.getX(), py = mc.player.getY(), pz = mc.player.getZ();
+        // основная линия — с запасом на размер снаряда; вторая проверка — как точка
+        Result res = compute(mc, w, yaw, pitch, px, py, pz, WIDE_MARGIN);
+        Result thin = compute(mc, w, yaw, pitch, px, py, pz, 0);
 
         if (res.landing != null) {
             Vec3d l = res.landing;
-            double dist = Math.hypot(l.x - mc.player.getX(), l.z - mc.player.getZ());
-            hudText = String.format(Locale.ROOT, "%s | падение: %d %d %d | дальность %.0f бл.",
-                    NAMES[w], (int) Math.floor(l.x), (int) Math.floor(l.y), (int) Math.floor(l.z), dist);
+            double dist = Math.hypot(l.x - px, l.z - pz);
+            String extra = "";
+            if (thin.landing != null) {
+                double dthin = Math.hypot(thin.landing.x - px, thin.landing.z - pz);
+                if (dthin - dist > 3) extra = String.format(Locale.ROOT, " | ЗАДЕНЕТ препятствие (без запаса было бы %.0f)", dthin);
+            }
+            hudText = String.format(Locale.ROOT, "%s | падение: %d %d %d | дальность %.0f бл.%s",
+                    NAMES[w], (int) Math.floor(l.x), (int) Math.floor(l.y), (int) Math.floor(l.z), dist, extra);
         } else {
             hudText = NAMES[w] + " | падение не видно: " + res.stop;
         }
@@ -121,7 +142,6 @@ public class SiegePredictor {
         VertexConsumer vc = consumers.getBuffer(RenderLayer.getLines());
         MatrixStack.Entry e = matrices.peek();
 
-        // белая линия траектории
         List<Vec3d> pts = new ArrayList<>(res.pts);
         if (res.landing != null) pts.add(res.landing);
         for (int i = 0; i + 1 < pts.size(); i++) {
@@ -131,7 +151,6 @@ public class SiegePredictor {
         if (res.landing != null) {
             Vec3d l = res.landing;
             double gy = l.y + 0.1;
-            // красный круг на земле
             int segs = 48;
             for (double rad : new double[]{RING_RADIUS, RING_RADIUS - 0.12}) {
                 Vec3d prev = null;
@@ -142,7 +161,6 @@ public class SiegePredictor {
                     prev = cur;
                 }
             }
-            // крестик в центре и столб вверх, чтобы место было видно издалека
             seg(vc, e, new Vec3d(l.x - 0.6, gy, l.z), new Vec3d(l.x + 0.6, gy, l.z), cam, 255, 40, 40, 255);
             seg(vc, e, new Vec3d(l.x, gy, l.z - 0.6), new Vec3d(l.x, gy, l.z + 0.6), cam, 255, 40, 40, 255);
             seg(vc, e, new Vec3d(l.x, gy, l.z), new Vec3d(l.x, gy + 8, l.z), cam, 255, 40, 40, 255);

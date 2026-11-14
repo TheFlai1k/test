@@ -2,5 +2,6 @@
   "key.siegerec.toggle": "Запись выстрелов вкл/выкл",
   "key.siegerec.label": "Выбрать орудие (требушет/катапульта/баллиста)",
   "key.siegerec.predict": "Прицел-предсказание вкл/выкл",
-  "category.siegerec": "Siege Recorder"
+  "category.siegerec": "Siege Recorder",
+  "key.siegerec.mark": "Отметить, куда упал снаряд (навести и нажать)"
 }

@@ -1,10 +1,15 @@
 package siegerec;
 
 import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
+import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
-import net.minecraft.client.render.Camera;
+import net.minecraft.client.render.RenderLayer;
 import net.minecraft.client.render.RenderTickCounter;
+import net.minecraft.client.render.VertexConsumer;
+import net.minecraft.client.render.VertexConsumerProvider;
+import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
@@ -37,8 +42,11 @@ public class SiegePredictor {
         String stop = "";
     }
 
+    private static String hudText = null;
+
     static void init() {
-        HudRenderCallback.EVENT.register(SiegePredictor::render);
+        WorldRenderEvents.AFTER_ENTITIES.register(SiegePredictor::renderWorld);
+        HudRenderCallback.EVENT.register(SiegePredictor::renderHud);
     }
 
     private static Result compute(MinecraftClient mc, int w, double yawDeg, double pitchDeg) {
@@ -85,95 +93,79 @@ public class SiegePredictor {
     // Радиус красного круга вокруг точки падения (в блоках)
     private static final double RING_RADIUS = 2.5;
 
-    private static void render(DrawContext ctx, RenderTickCounter tc) {
+    // Линия и круг рисуются прямо в мире (как обводка блока), поэтому они гладкие
+    // и стоят на месте, как бы ты ни двигал камеру (в том числе фрикам).
+    private static void renderWorld(WorldRenderContext ctx) {
         MinecraftClient mc = MinecraftClient.getInstance();
-        if (!enabled || mc.player == null || mc.world == null || mc.options.hudHidden) return;
+        hudText = null;
+        if (!enabled || mc.player == null || mc.world == null) return;
         int w = SiegeRecClient.labelIdx;
         if (w < 0 || w > 2) return;
+        MatrixStack matrices = ctx.matrixStack();
+        VertexConsumerProvider consumers = ctx.consumers();
+        if (matrices == null || consumers == null) return;
 
-        Camera cam = mc.gameRenderer.getCamera();
-        // Прицел считается от самого игрока (его позиция и его взгляд), а не от камеры.
-        // Камера (в том числе фрикам) нужна только для того, чтобы нарисовать линию на экране.
-        double yaw = mc.player.getYaw();
-        double pitch = mc.player.getPitch();
+        // прицел считается от самого игрока: его позиция и его взгляд
+        Result res = compute(mc, w, mc.player.getYaw(), mc.player.getPitch());
 
-        Result res = compute(mc, w, yaw, pitch);
+        if (res.landing != null) {
+            Vec3d l = res.landing;
+            double dist = Math.hypot(l.x - mc.player.getX(), l.z - mc.player.getZ());
+            hudText = String.format(Locale.ROOT, "%s | падение: %d %d %d | дальность %.0f бл.",
+                    NAMES[w], (int) Math.floor(l.x), (int) Math.floor(l.y), (int) Math.floor(l.z), dist);
+        } else {
+            hudText = NAMES[w] + " | падение не видно: " + res.stop;
+        }
 
-        int W = mc.getWindow().getScaledWidth();
-        int H = mc.getWindow().getScaledHeight();
-        double fovRad = Math.toRadians(mc.options.getFov().getValue());
-        double scale = (H / 2.0) / Math.tan(fovRad / 2.0);
-
-        Vec3d cp = cam.getPos();
-        double cy = Math.toRadians(cam.getYaw());
-        double cpit = Math.toRadians(cam.getPitch());
-        double fx = -Math.sin(cy) * Math.cos(cpit), fy = -Math.sin(cpit), fz = Math.cos(cy) * Math.cos(cpit);
-        double rx = -Math.cos(cy), ry = 0, rz = -Math.sin(cy);
-        double ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx;
-        double[] basis = {fx, fy, fz, rx, ry, rz, ux, uy, uz};
+        Vec3d cam = ctx.camera().getPos();
+        VertexConsumer vc = consumers.getBuffer(RenderLayer.getLines());
+        MatrixStack.Entry e = matrices.peek();
 
         // белая линия траектории
         List<Vec3d> pts = new ArrayList<>(res.pts);
         if (res.landing != null) pts.add(res.landing);
-        double[] prev = null;
-        for (int i = 0; i < pts.size(); i += 2) {
-            double[] cur = project(pts.get(i), cp, basis, W, H, scale);
-            line(ctx, prev, cur, 0xFFFFFFFF, W, H);
-            prev = cur;
-        }
-        if (!pts.isEmpty()) {
-            double[] last = project(pts.get(pts.size() - 1), cp, basis, W, H, scale);
-            line(ctx, prev, last, 0xFFFFFFFF, W, H);
+        for (int i = 0; i + 1 < pts.size(); i++) {
+            seg(vc, e, pts.get(i), pts.get(i + 1), cam, 255, 255, 255, 255);
         }
 
-        String text;
         if (res.landing != null) {
             Vec3d l = res.landing;
-            double dist = Math.hypot(l.x - mc.player.getX(), l.z - mc.player.getZ());
-            text = String.format(Locale.ROOT, "%s | падение: %d %d %d | дальность %.0f бл.",
-                    NAMES[w], (int) Math.floor(l.x), (int) Math.floor(l.y), (int) Math.floor(l.z), dist);
-
-            // красный круг на земле вокруг точки падения
-            double[] firstRing = null, prevRing = null;
-            int segs = 40;
-            for (int k = 0; k <= segs; k++) {
-                double a = 2 * Math.PI * k / segs;
-                Vec3d rp = new Vec3d(l.x + RING_RADIUS * Math.cos(a), l.y + 0.15, l.z + RING_RADIUS * Math.sin(a));
-                double[] cur = project(rp, cp, basis, W, H, scale);
-                line(ctx, prevRing, cur, 0xFFFF2020, W, H);
-                prevRing = cur;
+            double gy = l.y + 0.1;
+            // красный круг на земле
+            int segs = 48;
+            for (double rad : new double[]{RING_RADIUS, RING_RADIUS - 0.12}) {
+                Vec3d prev = null;
+                for (int k = 0; k <= segs; k++) {
+                    double a = 2 * Math.PI * k / segs;
+                    Vec3d cur = new Vec3d(l.x + rad * Math.cos(a), gy, l.z + rad * Math.sin(a));
+                    if (prev != null) seg(vc, e, prev, cur, cam, 255, 40, 40, 255);
+                    prev = cur;
+                }
             }
-            double[] c = project(new Vec3d(l.x, l.y + 0.15, l.z), cp, basis, W, H, scale);
-            if (c != null) {
-                int x = (int) c[0], y = (int) c[1];
-                ctx.fill(x - 2, y - 2, x + 2, y + 2, 0xFFFF2020);
-            }
-        } else {
-            text = NAMES[w] + " | падение не видно: " + res.stop;
-        }
-        int tw = mc.textRenderer.getWidth(text);
-        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(text), (W - tw) / 2, 18, 0xFFFFFFFF);
-    }
-
-    private static void line(DrawContext ctx, double[] a, double[] b, int color, int W, int H) {
-        if (a == null || b == null) return;
-        double dx = b[0] - a[0], dy = b[1] - a[1];
-        int n = (int) Math.min(Math.max(Math.abs(dx), Math.abs(dy)), 1500);
-        if (n < 1) n = 1;
-        for (int i = 0; i <= n; i++) {
-            int x = (int) (a[0] + dx * i / n);
-            int y = (int) (a[1] + dy * i / n);
-            if (x < -2 || x > W + 2 || y < -2 || y > H + 2) continue;
-            ctx.fill(x, y, x + 2, y + 2, color);
+            // крестик в центре и столб вверх, чтобы место было видно издалека
+            seg(vc, e, new Vec3d(l.x - 0.6, gy, l.z), new Vec3d(l.x + 0.6, gy, l.z), cam, 255, 40, 40, 255);
+            seg(vc, e, new Vec3d(l.x, gy, l.z - 0.6), new Vec3d(l.x, gy, l.z + 0.6), cam, 255, 40, 40, 255);
+            seg(vc, e, new Vec3d(l.x, gy, l.z), new Vec3d(l.x, gy + 8, l.z), cam, 255, 40, 40, 255);
         }
     }
 
-    private static double[] project(Vec3d p, Vec3d cp, double[] b, int W, int H, double scale) {
-        double dx = p.x - cp.x, dy = p.y - cp.y, dz = p.z - cp.z;
-        double cz = dx * b[0] + dy * b[1] + dz * b[2];
-        if (cz <= 0.05) return null;
-        double cx = dx * b[3] + dy * b[4] + dz * b[5];
-        double cyy = dx * b[6] + dy * b[7] + dz * b[8];
-        return new double[]{W / 2.0 + cx / cz * scale, H / 2.0 - cyy / cz * scale};
+    private static void seg(VertexConsumer vc, MatrixStack.Entry e, Vec3d a, Vec3d b, Vec3d cam,
+                            int r, int g, int bl, int al) {
+        float ax = (float) (a.x - cam.x), ay = (float) (a.y - cam.y), az = (float) (a.z - cam.z);
+        float bx = (float) (b.x - cam.x), by = (float) (b.y - cam.y), bz = (float) (b.z - cam.z);
+        float dx = bx - ax, dy = by - ay, dz = bz - az;
+        float len = (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (len < 1e-6f) return;
+        float nx = dx / len, ny = dy / len, nz = dz / len;
+        vc.vertex(e, ax, ay, az).color(r, g, bl, al).normal(e, nx, ny, nz);
+        vc.vertex(e, bx, by, bz).color(r, g, bl, al).normal(e, nx, ny, nz);
+    }
+
+    private static void renderHud(DrawContext ctx, RenderTickCounter tc) {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (hudText == null || mc.options.hudHidden) return;
+        int W = mc.getWindow().getScaledWidth();
+        int tw = mc.textRenderer.getWidth(hudText);
+        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(hudText), (W - tw) / 2, 18, 0xFFFFFFFF);
     }
 }

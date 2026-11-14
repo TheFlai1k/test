@@ -46,10 +46,11 @@ public class SiegeRecClient implements ClientModInitializer {
     private final Map<Integer, Track> tracks = new HashMap<>();
     private final Set<Integer> finished = new HashSet<>();
     private boolean recording = true;
-    private int labelIdx = 0;
+    static int labelIdx = 3;
     private long tick = 0;
     private KeyBinding toggleKey;
     private KeyBinding labelKey;
+    private KeyBinding predictKey;
 
     @Override
     public void onInitializeClient() {
@@ -57,6 +58,9 @@ public class SiegeRecClient implements ClientModInitializer {
                 "key.siegerec.toggle", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_J, "category.siegerec"));
         labelKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.siegerec.label", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_K, "category.siegerec"));
+        predictKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.siegerec.predict", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_L, "category.siegerec"));
+        SiegePredictor.init();
         ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
     }
 
@@ -83,9 +87,13 @@ public class SiegeRecClient implements ClientModInitializer {
             if (!recording) { tracks.clear(); finished.clear(); }
             msg(mc, recording ? "запись ВКЛЮЧЕНА" : "запись выключена");
         }
+        while (predictKey.wasPressed()) {
+            SiegePredictor.enabled = !SiegePredictor.enabled;
+            msg(mc, SiegePredictor.enabled ? "прицел-предсказание ВКЛЮЧЁН" : "прицел-предсказание выключен");
+        }
         while (labelKey.wasPressed()) {
             labelIdx = (labelIdx + 1) % LABELS.length;
-            msg(mc, "метка орудия: " + LABELS[labelIdx]);
+            msg(mc, "орудие: " + LABELS[labelIdx] + (labelIdx < 3 ? " (прицел показывается)" : " (прицел скрыт)"));
         }
         if (!recording) return;
         tick++;

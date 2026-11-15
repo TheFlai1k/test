@@ -20,6 +20,7 @@ import net.minecraft.registry.Registries;
 import net.minecraft.text.Text;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.RaycastContext;
 import org.lwjgl.glfw.GLFW;
@@ -46,6 +47,7 @@ public class SiegeRecClient implements ClientModInitializer {
         double px, py, pz;
         String vehicle = "нет";
         float vehicleYaw = 0;
+        List<float[]> hist = null; // взгляд игрока за последние тики до первого движения
     }
 
     private final Map<Integer, Track> tracks = new HashMap<>();
@@ -53,6 +55,7 @@ public class SiegeRecClient implements ClientModInitializer {
     private boolean recording = true;
     static int labelIdx = 3;
     private long tick = 0;
+    private final ArrayDeque<float[]> history = new ArrayDeque<>();
     private KeyBinding toggleKey;
     private KeyBinding labelKey;
     private KeyBinding predictKey;
@@ -115,6 +118,8 @@ public class SiegeRecClient implements ClientModInitializer {
         }
         if (!recording) return;
         tick++;
+        history.addLast(new float[]{mc.player.getYaw(), mc.player.getPitch()});
+        while (history.size() > 12) history.removeFirst();
 
         Set<Integer> seen = new HashSet<>();
         for (Entity e : mc.world.getEntities()) {
@@ -138,7 +143,10 @@ public class SiegeRecClient implements ClientModInitializer {
                 double dx = p[0] - l[0], dy = p[1] - l[1], dz = p[2] - l[2];
                 movedNow = dx * dx + dy * dy + dz * dz > 1e-6;
             }
-            if (movedNow) { t.still = 0; if (!t.moved) t.moved = true; }
+            if (movedNow) {
+                t.still = 0;
+                if (!t.moved) { t.moved = true; t.hist = new ArrayList<>(history); }
+            }
             else if (!t.pts.isEmpty()) t.still++;
 
             if (!t.moved) {
@@ -155,6 +163,7 @@ public class SiegeRecClient implements ClientModInitializer {
                 t.startTick = tick;
             }
             t.pts.add(p);
+            if (t.moved && tick % 2 == 0) updateLive(mc, t);
         }
 
         // завершение записей
@@ -173,6 +182,14 @@ public class SiegeRecClient implements ClientModInitializer {
             }
         }
         finished.retainAll(seen);
+    }
+
+    /** Пока снаряд летит: по уже виденной части дуги считаем, куда он реально упадёт. */
+    private void updateLive(MinecraftClient mc, Track t) {
+        double[] f = SiegePredictor.fit(t.pts);
+        if (f == null) return;
+        SiegePredictor.setLive(SiegePredictor.trace(mc, f[2], f[3], f[4], f[5], f[6], f[0], f[1],
+                SiegePredictor.WIDE_MARGIN, 8));
     }
 
     private static JsonArray arr(double[] v) {
@@ -267,11 +284,33 @@ public class SiegeRecClient implements ClientModInitializer {
         }
         o.add("points", pts);
 
-        // что предсказывал прицел для этого выстрела (по записанному взгляду и позиции игрока)
+        // реальный взгляд в момент выстрела: берём тик, где yaw совпадает с направлением полёта
+        double pathYaw = Math.toDegrees(Math.atan2(-(b[0] - a[0]), b[2] - a[2]));
+        float fireYaw = t.yaw, firePitch = t.pitch;
+        if (t.hist != null && !t.hist.isEmpty()) {
+            double best = 1e9;
+            int n = t.hist.size();
+            for (int i = 0; i < n; i++) {
+                float[] h = t.hist.get(i);
+                double score = Math.abs(MathHelper.wrapDegrees(h[0] - pathYaw)) + 0.01 * Math.abs(i - (n - 3));
+                if (score < best) { best = score; fireYaw = h[0]; firePitch = h[1]; }
+            }
+        }
+        o.addProperty("path_yaw", r(pathYaw));
+        o.addProperty("fire_yaw", r(fireYaw));
+        o.addProperty("fire_pitch", r(firePitch));
+        double[] fit = SiegePredictor.fit(t.pts);
+        if (fit != null) {
+            double th = Math.atan(fit[0]);
+            o.addProperty("fit_launch_deg", r(Math.toDegrees(th)));
+            o.addProperty("fit_Ccos2", Math.round(-fit[1] * Math.cos(th) * Math.cos(th) * 1e6) / 1e6);
+        }
+
+        // что предсказывал прицел для этого выстрела
         double[] predThin = null, predWide = null;
         if (labelIdx < 3) {
-            SiegePredictor.Result rt = SiegePredictor.compute(mc, labelIdx, t.yaw, t.pitch, t.px, t.py, t.pz, 0);
-            SiegePredictor.Result rw = SiegePredictor.compute(mc, labelIdx, t.yaw, t.pitch, t.px, t.py, t.pz, SiegePredictor.WIDE_MARGIN);
+            SiegePredictor.Result rt = SiegePredictor.compute(mc, labelIdx, fireYaw, firePitch, t.px, t.py, t.pz, 0);
+            SiegePredictor.Result rw = SiegePredictor.compute(mc, labelIdx, fireYaw, firePitch, t.px, t.py, t.pz, SiegePredictor.WIDE_MARGIN);
             if (rt.landing != null) predThin = new double[]{rt.landing.x, rt.landing.y, rt.landing.z};
             if (rw.landing != null) predWide = new double[]{rw.landing.x, rw.landing.y, rw.landing.z};
             o.add("pred_thin", arr(predThin));

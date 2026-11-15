@@ -27,8 +27,9 @@ import java.util.Locale;
 public class SiegePredictor {
 
     static final String[] NAMES = {"Требушет", "Катапульта", "Баллиста"};
-    // C = g / (2 v^2), подобрано по логам
-    private static final double[] C = {0.00315, 0.00832, 0.00187};
+    // C = C0 + C1 * sin(угол вылета); подобрано по логам (C = g / (2 v^2) в форме y = s*tan - C*s^2/cos^2)
+    private static final double[] C0 = {0.003078, 0.007854, 0.001825};
+    private static final double[] C1 = {0.000138, 0.000545, 0.000091};
     // откуда вылетает снаряд относительно игрока: вперёд (блоков) и вверх = H0 + H1 * угол_вверх
     private static final double[] FWD = {5.93, 5.42, 5.61};
     private static final double[] H0 = {8.74, 3.82, 3.67};
@@ -41,6 +42,7 @@ public class SiegePredictor {
 
     public static boolean enabled = true;
     private static String hudText = null;
+    private static String liveText = null;
 
     static class Result {
         final List<Vec3d> pts = new ArrayList<>();
@@ -67,28 +69,22 @@ public class SiegePredictor {
         return false;
     }
 
-    /** margin = 0: снаряд как точка; margin > 0: снаряд как кубик с запасом. */
-    static Result compute(MinecraftClient mc, int w, double yawDeg, double pitchDeg,
-                          double px, double py, double pz, double margin) {
+    /** Поправка: плагин при крутом наклоне (выше ~62°) стреляет примерно на 4,5° круче, чем смотрит игрок. */
+    static double launchDelta(double upDeg) {
+        if (upDeg <= 62) return 0;
+        if (upDeg >= 72) return 4.5;
+        return 4.5 * (upDeg - 62) / 10.0;
+    }
+
+    /** Полёт по параболе y = y0 + a*s + b*s^2 вдоль горизонтального направления (fx, fz). */
+    static Result trace(MinecraftClient mc, double x0, double y0, double z0, double fx, double fz,
+                        double a, double b, double margin, double startCheck) {
         Result res = new Result();
         ClientWorld world = mc.world;
-        double yaw = Math.toRadians(yawDeg);
-        double pitch = MathHelper.clamp(pitchDeg, -89.0, 89.0);
-        double up = -pitch; // градусы вверх
-        double th = Math.toRadians(up);
-        double tan = Math.tan(th);
-        double cos2 = Math.cos(th) * Math.cos(th);
-        double fx = -Math.sin(yaw), fz = Math.cos(yaw);
-
-        double x0 = px + fx * FWD[w];
-        double z0 = pz + fz * FWD[w];
-        double y0 = py + H0[w] + H1[w] * up;
-        double startCheck = margin > 0 ? 8 : 3;
-
         for (double s = 0; s <= 700; s += 0.5) {
             double x = x0 + fx * s;
             double z = z0 + fz * s;
-            double y = y0 + s * tan - C[w] * s * s / cos2;
+            double y = y0 + a * s + b * s * s;
             Vec3d p = new Vec3d(x, y, z);
             if (!world.getChunkManager().isChunkLoaded(MathHelper.floor(x) >> 4, MathHelper.floor(z) >> 4)) {
                 res.stop = "дальше загруженных чанков";
@@ -108,46 +104,72 @@ public class SiegePredictor {
         return res;
     }
 
-    private static void renderWorld(WorldRenderContext ctx) {
-        MinecraftClient mc = MinecraftClient.getInstance();
-        hudText = null;
-        if (!enabled || mc.player == null || mc.world == null) return;
-        int w = SiegeRecClient.labelIdx;
-        if (w < 0 || w > 2) return;
-        MatrixStack matrices = ctx.matrixStack();
-        VertexConsumerProvider consumers = ctx.consumers();
-        if (matrices == null || consumers == null) return;
+    /** margin = 0: снаряд как точка; margin > 0: снаряд как кубик с запасом. */
+    static Result compute(MinecraftClient mc, int w, double yawDeg, double pitchDeg,
+                          double px, double py, double pz, double margin) {
+        double yaw = Math.toRadians(yawDeg);
+        double pitch = MathHelper.clamp(pitchDeg, -89.0, 89.0);
+        double up = -pitch; // градусы вверх
+        double upL = MathHelper.clamp(up + launchDelta(up), -89.0, 89.0);
+        double th = Math.toRadians(upL);
+        double cos2 = Math.cos(th) * Math.cos(th);
+        double C = C0[w] + C1[w] * Math.sin(th);
+        double a = Math.tan(th), b = -C / cos2;
+        double fx = -Math.sin(yaw), fz = Math.cos(yaw);
 
-        double yaw = mc.player.getYaw(), pitch = mc.player.getPitch();
-        double px = mc.player.getX(), py = mc.player.getY(), pz = mc.player.getZ();
-        // основная линия — с запасом на размер снаряда; вторая проверка — как точка
-        Result res = compute(mc, w, yaw, pitch, px, py, pz, WIDE_MARGIN);
-        Result thin = compute(mc, w, yaw, pitch, px, py, pz, 0);
+        double x0 = px + fx * FWD[w];
+        double z0 = pz + fz * FWD[w];
+        double y0 = py + H0[w] + H1[w] * up;
+        return trace(mc, x0, y0, z0, fx, fz, a, b, margin, margin > 0 ? 8 : 3);
+    }
 
-        if (res.landing != null) {
-            Vec3d l = res.landing;
-            double dist = Math.hypot(l.x - px, l.z - pz);
-            String extra = "";
-            if (thin.landing != null) {
-                double dthin = Math.hypot(thin.landing.x - px, thin.landing.z - pz);
-                if (dthin - dist > 3) extra = String.format(Locale.ROOT, " | ЗАДЕНЕТ препятствие (без запаса было бы %.0f)", dthin);
-            }
-            hudText = String.format(Locale.ROOT, "%s | падение: %d %d %d | дальность %.0f бл.%s",
-                    NAMES[w], (int) Math.floor(l.x), (int) Math.floor(l.y), (int) Math.floor(l.z), dist, extra);
-        } else {
-            hudText = NAMES[w] + " | падение не видно: " + res.stop;
+    /** Подгонка параболы под реально наблюдаемый полёт. Возвращает {a, b, x0, y0, z0, fx, fz, длина} или null. */
+    static double[] fit(List<double[]> pts) {
+        if (pts.size() < 6) return null;
+        List<double[]> d = new ArrayList<>();
+        d.add(pts.get(0));
+        for (int i = 1; i < pts.size(); i++) {
+            double[] p = pts.get(i), l = d.get(d.size() - 1);
+            double dd = Math.abs(p[0] - l[0]) + Math.abs(p[1] - l[1]) + Math.abs(p[2] - l[2]);
+            if (dd > 1e-3) d.add(p);
         }
+        if (d.size() < 6) return null;
+        double[] f = d.get(0), e = d.get(d.size() - 1);
+        double hx = e[0] - f[0], hz = e[2] - f[2];
+        double hl = Math.hypot(hx, hz);
+        if (hl < 8) return null;
+        double fx = hx / hl, fz = hz / hl;
+        double s2 = 0, s3 = 0, s4 = 0, sy = 0, s2y = 0;
+        for (double[] p : d) {
+            double s = (p[0] - f[0]) * fx + (p[2] - f[2]) * fz;
+            double y = p[1] - f[1];
+            s2 += s * s; s3 += s * s * s; s4 += s * s * s * s;
+            sy += s * y; s2y += s * s * y;
+        }
+        double det = s2 * s4 - s3 * s3;
+        if (Math.abs(det) < 1e-9) return null;
+        double a = (sy * s4 - s3 * s2y) / det;
+        double b = (s2 * s2y - s3 * sy) / det;
+        if (b >= 0) return null;
+        return new double[]{a, b, f[0], f[1], f[2], fx, fz, hl};
+    }
 
-        Vec3d cam = ctx.camera().getPos();
-        VertexConsumer vc = consumers.getBuffer(RenderLayer.getLines());
-        MatrixStack.Entry e = matrices.peek();
+    // Результат по реально летящему снаряду (показывается зелёным)
+    private static Result liveRes = null;
+    private static long liveTime = 0;
 
+    static void setLive(Result r) {
+        liveRes = r;
+        liveTime = System.currentTimeMillis();
+    }
+
+    private static void drawPath(VertexConsumer vc, MatrixStack.Entry e, Vec3d cam, Result res,
+                                 int pr, int pg, int pb, int rr, int rg, int rb) {
         List<Vec3d> pts = new ArrayList<>(res.pts);
         if (res.landing != null) pts.add(res.landing);
         for (int i = 0; i + 1 < pts.size(); i++) {
-            seg(vc, e, pts.get(i), pts.get(i + 1), cam, 255, 255, 255, 255);
+            seg(vc, e, pts.get(i), pts.get(i + 1), cam, pr, pg, pb, 255);
         }
-
         if (res.landing != null) {
             Vec3d l = res.landing;
             double gy = l.y + 0.1;
@@ -157,13 +179,61 @@ public class SiegePredictor {
                 for (int k = 0; k <= segs; k++) {
                     double a = 2 * Math.PI * k / segs;
                     Vec3d cur = new Vec3d(l.x + rad * Math.cos(a), gy, l.z + rad * Math.sin(a));
-                    if (prev != null) seg(vc, e, prev, cur, cam, 255, 40, 40, 255);
+                    if (prev != null) seg(vc, e, prev, cur, cam, rr, rg, rb, 255);
                     prev = cur;
                 }
             }
-            seg(vc, e, new Vec3d(l.x - 0.6, gy, l.z), new Vec3d(l.x + 0.6, gy, l.z), cam, 255, 40, 40, 255);
-            seg(vc, e, new Vec3d(l.x, gy, l.z - 0.6), new Vec3d(l.x, gy, l.z + 0.6), cam, 255, 40, 40, 255);
-            seg(vc, e, new Vec3d(l.x, gy, l.z), new Vec3d(l.x, gy + 8, l.z), cam, 255, 40, 40, 255);
+            seg(vc, e, new Vec3d(l.x - 0.6, gy, l.z), new Vec3d(l.x + 0.6, gy, l.z), cam, rr, rg, rb, 255);
+            seg(vc, e, new Vec3d(l.x, gy, l.z - 0.6), new Vec3d(l.x, gy, l.z + 0.6), cam, rr, rg, rb, 255);
+            seg(vc, e, new Vec3d(l.x, gy, l.z), new Vec3d(l.x, gy + 8, l.z), cam, rr, rg, rb, 255);
+        }
+    }
+
+    private static void renderWorld(WorldRenderContext ctx) {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        hudText = null;
+        liveText = null;
+        if (!enabled || mc.player == null || mc.world == null) return;
+        MatrixStack matrices = ctx.matrixStack();
+        VertexConsumerProvider consumers = ctx.consumers();
+        if (matrices == null || consumers == null) return;
+        Vec3d cam = ctx.camera().getPos();
+        VertexConsumer vc = consumers.getBuffer(RenderLayer.getLines());
+        MatrixStack.Entry e = matrices.peek();
+        double px = mc.player.getX(), py = mc.player.getY(), pz = mc.player.getZ();
+
+        // 1) прицел до выстрела (белая линия, красный круг)
+        int w = SiegeRecClient.labelIdx;
+        if (w >= 0 && w <= 2) {
+            double yaw = mc.player.getYaw(), pitch = mc.player.getPitch();
+            Result res = compute(mc, w, yaw, pitch, px, py, pz, WIDE_MARGIN);
+            Result thin = compute(mc, w, yaw, pitch, px, py, pz, 0);
+            if (res.landing != null) {
+                Vec3d l = res.landing;
+                double dist = Math.hypot(l.x - px, l.z - pz);
+                String extra = "";
+                if (thin.landing != null) {
+                    double dthin = Math.hypot(thin.landing.x - px, thin.landing.z - pz);
+                    if (dthin - dist > 3) extra = String.format(Locale.ROOT, " | ЗАДЕНЕТ препятствие (без запаса было бы %.0f)", dthin);
+                }
+                hudText = String.format(Locale.ROOT, "%s | падение: %d %d %d | дальность %.0f бл.%s",
+                        NAMES[w], (int) Math.floor(l.x), (int) Math.floor(l.y), (int) Math.floor(l.z), dist, extra);
+            } else {
+                hudText = NAMES[w] + " | падение не видно: " + res.stop;
+            }
+            drawPath(vc, e, cam, res, 255, 255, 255, 255, 40, 40);
+        }
+
+        // 2) реальный снаряд в полёте: траектория по его настоящему движению (зелёная)
+        if (liveRes != null && System.currentTimeMillis() - liveTime < 40000) {
+            Result lr = liveRes;
+            if (lr.landing != null) {
+                Vec3d l = lr.landing;
+                liveText = String.format(Locale.ROOT, "Реальный выстрел упадёт: %d %d %d | дальность %.0f бл. от тебя",
+                        (int) Math.floor(l.x), (int) Math.floor(l.y), (int) Math.floor(l.z),
+                        Math.hypot(l.x - px, l.z - pz));
+            }
+            drawPath(vc, e, cam, lr, 80, 255, 100, 80, 255, 100);
         }
     }
 
@@ -181,9 +251,15 @@ public class SiegePredictor {
 
     private static void renderHud(DrawContext ctx, RenderTickCounter tc) {
         MinecraftClient mc = MinecraftClient.getInstance();
-        if (hudText == null || mc.options.hudHidden) return;
+        if (mc.options.hudHidden) return;
         int W = mc.getWindow().getScaledWidth();
-        int tw = mc.textRenderer.getWidth(hudText);
-        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(hudText), (W - tw) / 2, 18, 0xFFFFFFFF);
+        if (hudText != null) {
+            int tw = mc.textRenderer.getWidth(hudText);
+            ctx.drawTextWithShadow(mc.textRenderer, Text.literal(hudText), (W - tw) / 2, 18, 0xFFFFFFFF);
+        }
+        if (liveText != null) {
+            int tw = mc.textRenderer.getWidth(liveText);
+            ctx.drawTextWithShadow(mc.textRenderer, Text.literal(liveText), (W - tw) / 2, 30, 0xFF80FF80);
+        }
     }
 }

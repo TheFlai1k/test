@@ -31,7 +31,7 @@ public class SiegePredictor {
     private static final double[] C0 = {0.003078, 0.007854, 0.001825};
     private static final double[] C1 = {0.000138, 0.000545, 0.000091};
     // откуда вылетает снаряд относительно игрока: вперёд (блоков) и вверх = H0 + H1 * угол_вверх
-    private static final double[] FWD = {5.93, 5.42, 5.61};
+    static final double[] FWD = {5.93, 5.42, 5.61};
     private static final double[] H0 = {8.74, 3.82, 3.67};
     private static final double[] H1 = {0.0148, 0.0074, 0.0164};
 
@@ -102,7 +102,7 @@ public class SiegePredictor {
         return SPREAD[w][0] + f * (SPREAD[w][1] - SPREAD[w][0]);
     }
 
-    private static void drawMarker(VertexConsumer vc, MatrixStack.Entry e, Vec3d cam, Vec3d l,
+    static void drawMarker(VertexConsumer vc, MatrixStack.Entry e, Vec3d cam, Vec3d l,
                                    double rad, double height, int r, int g, int b) {
         double gy = l.y + 0.1;
         int segs = 24;
@@ -114,6 +114,45 @@ public class SiegePredictor {
             prev = cur;
         }
         seg(vc, e, new Vec3d(l.x, gy, l.z), new Vec3d(l.x, gy + height, l.z), cam, r, g, b, 255);
+    }
+
+    /** Высота снаряда на горизонтальной дистанции S от точки вылета при наклоне up (градусы вверх). */
+    static double yAtDist(int w, double up, double S, double py) {
+        double upL = MathHelper.clamp(up + launchDelta(w, up), -89.0, 89.0);
+        double th = Math.toRadians(upL);
+        double cos2 = Math.cos(th) * Math.cos(th);
+        double C = C0[w] + C1[w] * Math.sin(th);
+        return py + H0[w] + H1[w] * up + S * Math.tan(th) - C * S * S / cos2;
+    }
+
+    /** Все наклоны up, при которых снаряд на дистанции S оказывается на высоте ty. Обычно 0–2 штуки. */
+    static List<Double> solveUp(int w, double py, double S, double ty) {
+        List<Double> roots = new ArrayList<>();
+        double prevF = Double.NaN, prevU = 0;
+        for (double up = -15; up <= 89.0001; up += 0.1) {
+            double f = yAtDist(w, up, S, py) - ty;
+            if (!Double.isNaN(prevF) && prevF * f <= 0 && !(prevF == 0 && f == 0)) {
+                double lo = prevU, hi = up, flo = prevF;
+                for (int i = 0; i < 30; i++) {
+                    double mid = (lo + hi) / 2;
+                    double fm = yAtDist(w, mid, S, py) - ty;
+                    if (flo * fm <= 0) { hi = mid; } else { lo = mid; flo = fm; }
+                }
+                roots.add((lo + hi) / 2);
+            }
+            prevF = f;
+            prevU = up;
+        }
+        return roots;
+    }
+
+    /** Время полёта в тиках (g = 0.0236 блока/тик^2 по логам). */
+    static double flightTicks(int w, double up, double S) {
+        double upL = MathHelper.clamp(up + launchDelta(w, up), -89.0, 89.0);
+        double th = Math.toRadians(upL);
+        double C = C0[w] + C1[w] * Math.sin(th);
+        double v = Math.sqrt(0.0236 / (2 * C));
+        return S / (v * Math.cos(th));
     }
 
     /** Полёт по параболе y = y0 + a*s + b*s^2 вдоль горизонтального направления (fx, fz). */
@@ -233,6 +272,7 @@ public class SiegePredictor {
         MinecraftClient mc = MinecraftClient.getInstance();
         hudText = null;
         liveText = null;
+        SiegeAim.frame(mc); // плавный доворот взгляда каждый кадр
         if (!enabled || mc.player == null || mc.world == null) return;
         MatrixStack matrices = ctx.matrixStack();
         VertexConsumerProvider consumers = ctx.consumers();
@@ -275,6 +315,11 @@ public class SiegePredictor {
             drawPath(vc, e, cam, res, 255, 255, 255, 255, 40, 40);
         }
 
+        // 1b) цель доводки (голубой круг, радиус поражения 3 блока)
+        if (SiegeAim.markerPos != null) {
+            drawMarker(vc, e, cam, SiegeAim.markerPos, SiegeAim.RADIUS, 6, 60, 200, 255);
+        }
+
         // 2) реальный снаряд в полёте: траектория по его настоящему движению (зелёная)
         if (liveRes != null && System.currentTimeMillis() - liveTime < 40000) {
             Result lr = liveRes;
@@ -311,6 +356,15 @@ public class SiegePredictor {
         if (liveText != null) {
             int tw = mc.textRenderer.getWidth(liveText);
             ctx.drawTextWithShadow(mc.textRenderer, Text.literal(liveText), (W - tw) / 2, 30, 0xFF80FF80);
+        }
+        if (SiegeAim.line1 != null) {
+            int tw = mc.textRenderer.getWidth(SiegeAim.line1);
+            ctx.drawTextWithShadow(mc.textRenderer, Text.literal(SiegeAim.line1), (W - tw) / 2, 42, 0xFF60C8FF);
+        }
+        if (SiegeAim.line2 != null) {
+            int tw = mc.textRenderer.getWidth(SiegeAim.line2);
+            ctx.drawTextWithShadow(mc.textRenderer, Text.literal(SiegeAim.line2), (W - tw) / 2, 54,
+                    SiegeAim.warn ? 0xFFFF5050 : 0xFFFFFFFF);
         }
     }
 }

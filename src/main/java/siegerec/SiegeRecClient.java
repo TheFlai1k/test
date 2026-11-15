@@ -79,6 +79,7 @@ public class SiegeRecClient implements ClientModInitializer {
         markKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.siegerec.mark", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_U, "category.siegerec"));
         SiegePredictor.init();
+        SiegeAim.init();
         ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
     }
 

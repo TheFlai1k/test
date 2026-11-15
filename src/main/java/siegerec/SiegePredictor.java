@@ -102,6 +102,20 @@ public class SiegePredictor {
         return SPREAD[w][0] + f * (SPREAD[w][1] - SPREAD[w][0]);
     }
 
+    private static void drawMarker(VertexConsumer vc, MatrixStack.Entry e, Vec3d cam, Vec3d l,
+                                   double rad, double height, int r, int g, int b) {
+        double gy = l.y + 0.1;
+        int segs = 24;
+        Vec3d prev = null;
+        for (int k = 0; k <= segs; k++) {
+            double a = 2 * Math.PI * k / segs;
+            Vec3d cur = new Vec3d(l.x + rad * Math.cos(a), gy, l.z + rad * Math.sin(a));
+            if (prev != null) seg(vc, e, prev, cur, cam, r, g, b, 255);
+            prev = cur;
+        }
+        seg(vc, e, new Vec3d(l.x, gy, l.z), new Vec3d(l.x, gy + height, l.z), cam, r, g, b, 255);
+    }
+
     /** Полёт по параболе y = y0 + a*s + b*s^2 вдоль горизонтального направления (fx, fz). */
     static Result trace(MinecraftClient mc, double x0, double y0, double z0, double fx, double fz,
                         double a, double b, double margin, double startCheck) {

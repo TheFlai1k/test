@@ -3,5 +3,8 @@
   "key.siegerec.label": "Выбрать орудие (требушет/катапульта/баллиста)",
   "key.siegerec.predict": "Прицел-предсказание вкл/выкл",
   "category.siegerec": "Siege Recorder",
-  "key.siegerec.mark": "Отметить, куда упал снаряд (навести и нажать)"
+  "key.siegerec.mark": "Отметить, куда упал снаряд (навести и нажать)",
+  "key.siegerec.aim_target": "Цель: игрок или точка под прицелом камеры (можно из фрикама)",
+  "key.siegerec.aim_cluster": "Цель: лучшая кучка врагов",
+  "key.siegerec.aim_toggle": "Доводка прицела: пауза / продолжить"
 }

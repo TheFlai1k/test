@@ -297,8 +297,17 @@ public class SiegeRecClient implements ClientModInitializer {
             }
         }
         o.addProperty("path_yaw", r(pathYaw));
-        o.addProperty("fire_yaw", r(fireYaw));
+        o.addProperty("fire_yaw", r(MathHelper.wrapDegrees(fireYaw)));
         o.addProperty("fire_pitch", r(firePitch));
+        if (t.hist != null) {
+            JsonArray vh = new JsonArray();
+            for (float[] h : t.hist) {
+                JsonArray one = new JsonArray();
+                one.add(r(MathHelper.wrapDegrees(h[0]))); one.add(r(h[1]));
+                vh.add(one);
+            }
+            o.add("view_history", vh);
+        }
         double[] fit = SiegePredictor.fit(t.pts);
         if (fit != null) {
             double th = Math.atan(fit[0]);

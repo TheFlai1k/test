@@ -69,11 +69,37 @@ public class SiegePredictor {
         return false;
     }
 
-    /** Поправка: плагин при крутом наклоне (выше ~62°) стреляет примерно на 4,5° круче, чем смотрит игрок. */
-    static double launchDelta(double upDeg) {
-        if (upDeg <= 62) return 0;
-        if (upDeg >= 72) return 4.5;
-        return 4.5 * (upDeg - 62) / 10.0;
+    /** Линейная интерполяция по таблице {угол, значение}. */
+    private static double interp(double[][] t, double x) {
+        if (x <= t[0][0]) return t[0][1];
+        for (int i = 1; i < t.length; i++) {
+            if (x <= t[i][0]) {
+                double f = (x - t[i - 1][0]) / (t[i][0] - t[i - 1][0]);
+                return t[i - 1][1] + f * (t[i][1] - t[i - 1][1]);
+            }
+        }
+        return t[t.length - 1][1];
+    }
+
+    // Поправка угла вылета (градусы): насколько плагин стреляет выше (+) или ниже (-), чем смотрит игрок.
+    // Таблицы {наклон вверх, поправка}, подобраны по логам.
+    private static final double[][] DELTA_TREB = {{-5, 3.7}, {0, 3.7}, {8, -0.2}, {20, 0.9}, {45, 0.0}, {62, 0.6}, {72, 4.3}, {90, 4.3}};
+    private static final double[][] DELTA_CAT = {{-5, -2.0}, {10, -2.0}, {50, -1.0}, {62, 0.0}, {72, 4.5}, {90, 4.5}};
+    // Баллиста: почти линейно, launch = 1.093 * up - 2.9
+    private static final double[][] DELTA_BAL = {{-20, -4.7}, {-5, -3.4}, {0, -2.9}, {20, -1.0}, {45, 1.3}, {70, 3.6}, {90, 5.5}};
+
+    static double launchDelta(int w, double up) {
+        if (w == 0) return interp(DELTA_TREB, up);
+        if (w == 1) return interp(DELTA_CAT, up);
+        return interp(DELTA_BAL, up);
+    }
+
+    // Случайный разброс угла вылета у самого плагина (градусы): {на малых углах, на крутых}
+    private static final double[][] SPREAD = {{2.6, 0.6}, {4.0, 0.8}, {1.6, 0.3}};
+
+    static double spreadDeg(int w, double upDeg) {
+        double f = MathHelper.clamp((upDeg - 45.0) / 23.0, 0.0, 1.0);
+        return SPREAD[w][0] + f * (SPREAD[w][1] - SPREAD[w][0]);
     }
 
     /** Полёт по параболе y = y0 + a*s + b*s^2 вдоль горизонтального направления (fx, fz). */
@@ -110,7 +136,7 @@ public class SiegePredictor {
         double yaw = Math.toRadians(yawDeg);
         double pitch = MathHelper.clamp(pitchDeg, -89.0, 89.0);
         double up = -pitch; // градусы вверх
-        double upL = MathHelper.clamp(up + launchDelta(up), -89.0, 89.0);
+        double upL = MathHelper.clamp(up + launchDelta(w, up), -89.0, 89.0);
         double th = Math.toRadians(upL);
         double cos2 = Math.cos(th) * Math.cos(th);
         double C = C0[w] + C1[w] * Math.sin(th);
@@ -208,6 +234,17 @@ public class SiegePredictor {
             double yaw = mc.player.getYaw(), pitch = mc.player.getPitch();
             Result res = compute(mc, w, yaw, pitch, px, py, pz, WIDE_MARGIN);
             Result thin = compute(mc, w, yaw, pitch, px, py, pz, 0);
+            double sp = spreadDeg(w, -pitch);
+            Result lo = compute(mc, w, yaw, pitch + sp, px, py, pz, 0);
+            Result hi = compute(mc, w, yaw, pitch - sp, px, py, pz, 0);
+            String band = "";
+            if (lo.landing != null && hi.landing != null) {
+                double d1 = Math.hypot(lo.landing.x - px, lo.landing.z - pz);
+                double d2 = Math.hypot(hi.landing.x - px, hi.landing.z - pz);
+                band = String.format(Locale.ROOT, " | разброс ±%.1f°: %.0f–%.0f бл.", sp, Math.min(d1, d2), Math.max(d1, d2));
+                drawMarker(vc, e, cam, lo.landing, 1.0, 3, 255, 170, 40);
+                drawMarker(vc, e, cam, hi.landing, 1.0, 3, 255, 170, 40);
+            }
             if (res.landing != null) {
                 Vec3d l = res.landing;
                 double dist = Math.hypot(l.x - px, l.z - pz);
@@ -217,7 +254,7 @@ public class SiegePredictor {
                     if (dthin - dist > 3) extra = String.format(Locale.ROOT, " | ЗАДЕНЕТ препятствие (без запаса было бы %.0f)", dthin);
                 }
                 hudText = String.format(Locale.ROOT, "%s | падение: %d %d %d | дальность %.0f бл.%s",
-                        NAMES[w], (int) Math.floor(l.x), (int) Math.floor(l.y), (int) Math.floor(l.z), dist, extra);
+                        NAMES[w], (int) Math.floor(l.x), (int) Math.floor(l.y), (int) Math.floor(l.z), dist, extra) + band;
             } else {
                 hudText = NAMES[w] + " | падение не видно: " + res.stop;
             }
